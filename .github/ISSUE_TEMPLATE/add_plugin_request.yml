@@ -22,14 +22,22 @@ body:
       label: Category
       description: "Select the primary category for this plugin."
       options:
-        - gametool
-        - utility
         - adapter
-        - chat
-        - storage
-        - management
-        - custom # Add more relevant categories as needed
-      default: 0
+        - ai
+        - extension
+        - game
+        - gametool
+        - general
+        - image
+        - life
+        - manage
+        - media
+        - meme
+        - other
+        - preset
+        - tool
+        - webui
+      default: 0 # This will default to 'adapter'
     validations:
       required: true
   - type: markdown
