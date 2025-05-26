@@ -5,14 +5,11 @@ on:
     types: [created]
 
 permissions:
-  issues: write # To comment on issues
-  contents: read # To read repository content (though not strictly needed for this basic version, good to have if you expand)
+  issues: write # To comment on issues and close them
+  contents: read # To read repository content (though not strictly needed for this basic version)
 
 jobs:
   process_plugin_request:
-    # Only run if the comment is on an issue (not a PR)
-    # and the comment starts with the approval command
-    # and the commenter has appropriate permissions (OWNER, MEMBER, COLLABORATOR)
     if: |
       !github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/approve-plugin') &&
@@ -26,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js # Though not used directly, good practice if future JS scripts are added
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -34,85 +31,97 @@ jobs:
       - name: Parse command and issue data, then call API
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PLUGIN_API_KEY: ${{ secrets.YOUR_PLUGIN_API_KEY }} # IMPORTANT: Store your API key as a secret
+          PLUGIN_API_KEY: ${{ secrets.YOUR_PLUGIN_API_KEY }}
           API_ENDPOINT: "https://exp.kp.itzdrli.cc/api/add-plugin"
         run: |
           set -e # Exit immediately if a command exits with a non-zero status.
 
-          ISSUE_BODY=$(gh issue view ${{ github.event.issue.number }} --json body --jq .body)
+          ISSUE_NUMBER=${{ github.event.issue.number }}
           COMMENT_BODY="${{ github.event.comment.body }}"
 
-          echo "Issue Body: $ISSUE_BODY"
+          # Fetch issue body. Using jq -r to get raw string.
+          echo "Fetching issue body for issue #$ISSUE_NUMBER..."
+          ISSUE_BODY_JSON=$(gh issue view "$ISSUE_NUMBER" --json body)
+          ISSUE_BODY=$(echo "$ISSUE_BODY_JSON" | jq -r .body)
+
+          echo "Issue Body (first 200 chars): $(echo "$ISSUE_BODY" | head -c 200)..."
           echo "Comment Body: $COMMENT_BODY"
 
           # --- Extract packageName from issue body ---
-          # This assumes the issue template creates a parsable structure.
-          # A more robust way is to parse the structured YAML from the issue form submission if GitHub API allows.
-          # For now, we'll try a regex based on the markdown output of the input field.
-          # The exact regex might need adjustment based on how GitHub renders the issue body from the form.
-          # Typically it's like: ### NPM Package Name\n\nkoishi-plugin-name
-          PACKAGE_NAME_RAW=$(echo "$ISSUE_BODY" | grep -i -A 1 "NPM Package Name" | tail -n 1 | xargs)
-          # If the above is unreliable, an alternative might be to parse the issue body for specific markers.
-          # For issue forms, GitHub often renders them like:
-          # **NPM Package Name**
+          # Expected format in issue body:
+          # ### NPM Package Name
           # actual-package-name
-          # PACKAGE_NAME_RAW=$(echo "$ISSUE_BODY" | awk '/\*\*NPM Package Name\*\*/{getline; print}' | tr -d '\r' | xargs)
+          # Using grep -A 1 (line after match) and tail -n 1 (to get that line), then xargs to trim.
+          # Added -i for case-insensitivity on the header.
+          PACKAGE_NAME_RAW=$(echo "$ISSUE_BODY" | grep -A 1 -i "^### NPM Package Name$" | tail -n 1 | xargs)
+          echo "Debug: Line potentially containing package name: '$(echo "$ISSUE_BODY" | grep -A 1 -i "^### NPM Package Name$" | tail -n 1)'"
+          echo "Raw Package Name from Issue (after xargs): '$PACKAGE_NAME_RAW'"
 
-          # Try another common pattern for issue forms output:
-          if [[ -z "$PACKAGE_NAME_RAW" || "$PACKAGE_NAME_RAW" == "NPM Package Name" ]]; then
-            PACKAGE_NAME_RAW=$(echo "$ISSUE_BODY" | sed -n -e '/### NPM Package Name/,/###/ s/### NPM Package Name//p' | sed -n '2p' | awk '{$1=$1};1')
-          fi
-          echo "Raw Package Name from Issue: '$PACKAGE_NAME_RAW'"
-          if [[ -z "$PACKAGE_NAME_RAW" ]]; then
-            echo "::error::Could not extract package name from issue body."
-            gh issue comment ${{ github.event.issue.number }} --body "❌ Error: Could not extract `packageName` from the issue body. Please ensure it was filled correctly."
+          # Validate extraction
+          if [[ -z "$PACKAGE_NAME_RAW" || "$PACKAGE_NAME_RAW" == "NPM Package Name" || "$PACKAGE_NAME_RAW" =~ ^### ]]; then
+            ERROR_MESSAGE="❌ Error: Could not extract \`packageName\` from the issue body.
+            The bot expected to find a header '### NPM Package Name' followed by the package name on the next line in the issue's Markdown.
+            Please ensure the issue was created using the correct template and the 'NPM Package Name' field was filled.
+            Raw value extracted: '$PACKAGE_NAME_RAW'"
+            echo "::error::$ERROR_MESSAGE"
+            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
             exit 1
           fi
 
           # --- Validate packageName format ---
           # Allowed formats: @scope/koishi-plugin-*, koishi-plugin-*, @koishijs/plugin-*
-          if ! [[ "$PACKAGE_NAME_RAW" =~ ^@([a-zA-Z0-9_-]+)\/koishi-plugin-([a-zA-Z0-9_-]+)$ || \
-                  "$PACKAGE_NAME_RAW" =~ ^koishi-plugin-([a-zA-Z0-9_-]+)$ || \
-                  "$PACKAGE_NAME_RAW" =~ ^@koishijs\/plugin-([a-zA-Z0-9_-]+)$ ]]; then
-            echo "::error::Invalid package name format: $PACKAGE_NAME_RAW"
-            gh issue comment ${{ github.event.issue.number }} --body "❌ Error: Invalid `packageName` format: \`$PACKAGE_NAME_RAW\`. Allowed formats are \`@scope/koishi-plugin-*\`, \`koishi-plugin-*\`, or \`@koishijs/plugin-*\`."
+          # Added '.' and '-' to allowed characters in package names.
+          if ! [[ "$PACKAGE_NAME_RAW" =~ ^@([a-zA-Z0-9_.-]+)\/koishi-plugin-([a-zA-Z0-9_.-]+)$ || \
+                  "$PACKAGE_NAME_RAW" =~ ^koishi-plugin-([a-zA-Z0-9_.-]+)$ || \
+                  "$PACKAGE_NAME_RAW" =~ ^@koishijs\/plugin-([a-zA-Z0-9_.-]+)$ ]]; then
+            ERROR_MESSAGE="❌ Error: Invalid \`packageName\` format: \`$PACKAGE_NAME_RAW\`.
+            Allowed formats are \`@scope/koishi-plugin-*\`, \`koishi-plugin-*\`, or \`@koishijs/plugin-*\`."
+            echo "::error::$ERROR_MESSAGE"
+            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
             exit 1
           fi
-          PACKAGE_NAME="$PACKAGE_NAME_RAW"
+          PACKAGE_NAME="$PACKAGE_NAME_RAW" # Use validated package name
           echo "Validated Package Name: $PACKAGE_NAME"
 
           # --- Extract initial category from issue body ---
-          # This also assumes a parsable structure from the issue template output
-          # INITIAL_CATEGORY_RAW=$(echo "$ISSUE_BODY" | awk '/\*\*Category\*\*/{getline; print}' | tr -d '\r' | xargs)
-          # Try another common pattern for issue forms output:
-          INITIAL_CATEGORY_RAW=$(echo "$ISSUE_BODY" | sed -n -e '/### Category/,/###/ s/### Category//p' | sed -n '2p' | awk '{$1=$1};1')
-          if [[ -z "$INITIAL_CATEGORY_RAW" || "$INITIAL_CATEGORY_RAW" == "Category" ]]; then
-             echo "::warning::Could not extract initial category from issue. Will rely on command or default."
-             INITIAL_CATEGORY_RAW="" # Set to empty if not found
+          # Expected format:
+          # ### Category
+          # actual-category
+          INITIAL_CATEGORY_RAW=$(echo "$ISSUE_BODY" | grep -A 1 -i "^### Category$" | tail -n 1 | xargs)
+          echo "Debug: Line potentially containing category: '$(echo "$ISSUE_BODY" | grep -A 1 -i "^### Category$" | tail -n 1)'"
+          echo "Raw Initial Category from Issue (after xargs): '$INITIAL_CATEGORY_RAW'"
+
+          # If grep found nothing, or if it found the header of the *next* section, or the Category header itself.
+          if [[ -z "$INITIAL_CATEGORY_RAW" || "$INITIAL_CATEGORY_RAW" == "Category" || "$INITIAL_CATEGORY_RAW" =~ ^### ]]; then
+             echo "::warning::Could not reliably extract initial category from issue. Will rely on command argument if provided."
+             INITIAL_CATEGORY_RAW="" # Treat as not found
           fi
-          echo "Initial Category from Issue: '$INITIAL_CATEGORY_RAW'"
+          echo "Initial Category (after cleanup): '$INITIAL_CATEGORY_RAW'"
 
 
           # --- Parse command arguments ---
           VERIFIED_ARG=$(echo "$COMMENT_BODY" | grep -oP 'verified:\s*\K(true|false)')
           RATING_ARG=$(echo "$COMMENT_BODY" | grep -oP 'rating:\s*\K([0-9]+(\.[0-9]+)?)')
-          CATEGORY_ARG=$(echo "$COMMENT_BODY" | grep -oP 'category:\s*\K(\S+)') # \S+ matches non-whitespace
+          CATEGORY_ARG_FROM_CMD=$(echo "$COMMENT_BODY" | grep -oP 'category:\s*\K([^ ]+)') # Match non-space characters
 
           if [[ -z "$VERIFIED_ARG" || -z "$RATING_ARG" ]]; then
-            echo "::error::Missing verified or rating in command."
-            gh issue comment ${{ github.event.issue.number }} --body "❌ Error: Command is missing \`verified\` or \`rating\`. Usage: \`/approve-plugin verified:[true|false] rating:[0.0-5.0] [category:new-category]\`"
+            ERROR_MESSAGE="❌ Error: Command is missing \`verified\` or \`rating\`.
+            Usage: \`/approve-plugin verified:[true|false] rating:[0.0-5.0] [category:new-category]\`"
+            echo "::error::$ERROR_MESSAGE"
+            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
             exit 1
           fi
 
-          # Use category from command if provided, otherwise from issue, otherwise error if neither
-          FINAL_CATEGORY="$CATEGORY_ARG"
+          # Determine final category: command > issue > error
+          FINAL_CATEGORY="$CATEGORY_ARG_FROM_CMD"
           if [[ -z "$FINAL_CATEGORY" ]]; then
             FINAL_CATEGORY="$INITIAL_CATEGORY_RAW"
           fi
 
           if [[ -z "$FINAL_CATEGORY" ]]; then
-            echo "::error::Category not provided in command and not found in issue."
-            gh issue comment ${{ github.event.issue.number }} --body "❌ Error: \`category\` was not provided in the command and could not be found in the original issue submission."
+            ERROR_MESSAGE="❌ Error: \`category\` was not provided in the approval command and could not be reliably extracted from the original issue submission."
+            echo "::error::$ERROR_MESSAGE"
+            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
             exit 1
           fi
 
@@ -122,6 +131,14 @@ jobs:
           echo "Using Category: $FINAL_CATEGORY"
 
           # --- Construct JSON payload ---
+          # Ensure PLUGIN_API_KEY is set in secrets
+          if [[ -z "$PLUGIN_API_KEY" ]]; then
+            ERROR_MESSAGE="❌ Error: PLUGIN_API_KEY is not configured in the workflow secrets."
+            echo "::error::$ERROR_MESSAGE"
+            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
+            exit 1
+          fi
+
           JSON_PAYLOAD=$(cat <<EOF
           {
             "packageName": "$PACKAGE_NAME",
@@ -131,30 +148,39 @@ jobs:
             "category": "$FINAL_CATEGORY"
           }
           EOF
-          )
+          ) # Important: No space after EOF
 
           echo "Payload: $JSON_PAYLOAD"
 
           # --- Send POST request ---
-          HTTP_RESPONSE=$(curl -s -w "%{http_code}" -X POST "$API_ENDPOINT" \
+          # Store response and status separately to handle multi-line bodies correctly
+          HTTP_RESPONSE_WITH_CODE=$(curl -s -w "\\n%{http_code}" -X POST "$API_ENDPOINT" \
             -H "Content-Type: application/json" \
             -d "$JSON_PAYLOAD")
 
-          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n1)
-          HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d') # Get all but last line
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE_WITH_CODE" | tail -n1)
+          HTTP_BODY=$(echo "$HTTP_RESPONSE_WITH_CODE" | sed '$d') # Get all but last line
 
           echo "API Response Status: $HTTP_STATUS"
-          echo "API Response Body: $HTTP_BODY"
+          echo "API Response Body (first 200 chars): $(echo "$HTTP_BODY" | head -c 200)..."
 
           if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then
-            MESSAGE="✅ Plugin \`$PACKAGE_NAME\` submitted successfully to the registry with rating \`$RATING_ARG\`, verified status \`$VERIFIED_ARG\`, and category \`$FINAL_CATEGORY\`."
-            gh issue comment ${{ github.event.issue.number }} --body "$MESSAGE"
-            gh issue close ${{ github.event.issue.number }} --reason "completed"
-            echo "$MESSAGE"
+            SUCCESS_MESSAGE="✅ Plugin \`$PACKAGE_NAME\` submitted successfully to the registry with rating \`$RATING_ARG\`, verified status \`$VERIFIED_ARG\`, and category \`$FINAL_CATEGORY\`."
+            echo "$SUCCESS_MESSAGE"
+            gh issue comment "$ISSUE_NUMBER" --body "$SUCCESS_MESSAGE"
+            gh issue close "$ISSUE_NUMBER" --reason "completed"
           else
-            MESSAGE="❌ Error submitting plugin \`$PACKAGE_NAME\` to the registry. API responded with status \`$HTTP_STATUS\`."
-            ERROR_DETAILS="API Response: \`$HTTP_BODY\`"
-            gh issue comment ${{ github.event.issue.number }} --body "$MESSAGE\n$ERROR_DETAILS"
-            echo "::error::$MESSAGE $ERROR_DETAILS"
-            exit 1
+            # Sanitize API body for comment to prevent Markdown injection or overly long messages
+            SANITIZED_API_BODY=$(echo "$HTTP_BODY" | tr -d '`' | head -c 500) # Remove backticks and limit length
+            if [[ ${#HTTP_BODY} -gt 500 ]]; then SANITIZED_API_BODY="$SANITIZED_API_BODY..."; fi
+
+            ERROR_MESSAGE="❌ Error submitting plugin \`$PACKAGE_NAME\` to the registry.
+            API responded with status: \`$HTTP_STATUS\`
+            API Response Body:
+            \`\`\`
+            $SANITIZED_API_BODY
+            \`\`\`"
+            echo "::error::Error submitting plugin. Status: $HTTP_STATUS. Body: $HTTP_BODY"
+            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
+            exit 1 # Ensure the job fails
           fi
