@@ -1,0 +1,43 @@
+name: ✨ Request New Plugin Addition
+description: Suggest a Koishi plugin to be added to the registry.
+title: "[Plugin Request]: "
+labels: ["plugin-request", "pending-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest a new plugin!
+        Please fill out the details below.
+  - type: input
+    id: packageName
+    attributes:
+      label: NPM Package Name
+      description: "The full name of the NPM package."
+      placeholder: "e.g., koishi-plugin-your-plugin, @scope/koishi-plugin-another"
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: "Select the primary category for this plugin."
+      options:
+        - gametool
+        - utility
+        - adapter
+        - chat
+        - storage
+        - management
+        - custom # Add more relevant categories as needed
+      default: 0
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **For maintainers:**
+        To process this request, a repository author or contributor should comment on this issue with the command:
+        `/approve-plugin verified:[true|false] rating:[0.0-5.0]`
+        Optionally, you can override the category:
+        `/approve-plugin verified:[true|false] rating:[0.0-5.0] category:[new-category]`
