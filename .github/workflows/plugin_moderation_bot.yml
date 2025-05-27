@@ -1,178 +1,157 @@
-name: Plugin Moderation Bot
+name: Koishi Plugin - Approve Request
 
 on:
   issue_comment:
-    types: [created]
-
-permissions:
-  issues: write # To comment on issues and close them
-  contents: read
+    types: [created] # 仅当评论创建时触发
 
 jobs:
-  process_plugin_request:
-    if: |
-      !github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/approve-plugin') &&
-      (
-        github.event.comment.author_association == 'OWNER' ||
-        github.event.comment.author_association == 'MEMBER' ||
-        github.event.comment.author_association == 'COLLABORATOR'
-      )
+  approve_and_add_plugin:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # 读取 issue body
+      issues: write  # 用于后续可选的添加评论，虽然当前未启用
+      pull-requests: write # for comment cleanup/reactions (optional)
+
+    # 检查评论是否包含 /approve-plugin 命令，并且评论者是仓库成员或贡献者
+    if: |
+      contains(github.event.comment.body, '/approve-plugin') &&
+      (github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'CONTRIBUTOR' || github.event.comment.author_association == 'OWNER')
+    
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Parse Command Arguments from Comment
+        id: parse_command
+        uses: actions/github-script@v6
         with:
-          node-version: '20'
+          script: |
+            const commentBody = process.env.COMMENT_BODY;
+            const core = require('@actions/core');
 
-      - name: Parse command and issue data, then call API
+            let rating = null;
+            let verified = false; // 默认值为 false
+            let category = null;  // 默认为 null，将从 Issue 获取或被覆盖
+
+            // 提取 rating (必选)
+            const ratingMatch = commentBody.match(/rating:([\d.]+)/);
+            if (ratingMatch && ratingMatch[1]) {
+              rating = parseFloat(ratingMatch[1]);
+              // 验证 rating 范围 (可选，但推荐)
+              if (isNaN(rating) || rating < 0.0 || rating > 5.0) {
+                core.setFailed(`Invalid rating value: "${ratingMatch[1]}". Rating must be between 0.0 and 5.0.`);
+                return;
+              }
+            } else {
+              core.setFailed("Required 'rating' parameter missing or invalid. Usage: /approve-plugin rating:[0.0-5.0]");
+              return;
+            }
+
+            // 提取 verified (可选)
+            const verifiedMatch = commentBody.match(/verified:(true|false)/);
+            if (verifiedMatch && verifiedMatch[1]) {
+              verified = verifiedMatch[1] === 'true';
+            }
+
+            // 提取 category (可选)
+            const categoryMatch = commentBody.match(/category:([\w-]+)/);
+            if (categoryMatch && categoryMatch[1]) {
+              category = categoryMatch[1];
+            }
+
+            core.setOutput('rating', rating);
+            core.setOutput('verified', verified);
+            core.setOutput('overridden_category', category); // 区分 Issue 模板的 category
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PLUGIN_API_KEY: ${{ secrets.YOUR_PLUGIN_API_KEY }}
-          API_ENDPOINT: "https://exp.kp.itzdrli.cc/api/add-plugin"
+          COMMENT_BODY: ${{ github.event.comment.body }}
+
+      - name: Extract Package Name and Original Category from Issue Body
+        id: extract_issue_data
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueBody = process.env.ISSUE_BODY;
+            const core = require('@actions/core');
+
+            let packageName = null;
+            let originalCategory = null;
+
+            const lines = issueBody.split('\n');
+            let captureNextLineForPackage = false;
+            let captureNextLineForCategory = false;
+
+            for (const line of lines) {
+              if (line.includes('NPM Package Name')) {
+                captureNextLineForPackage = true;
+                captureNextLineForCategory = false;
+                continue;
+              }
+              if (line.includes('Category')) {
+                captureNextLineForCategory = true;
+                captureNextLineForPackage = false;
+                continue;
+              }
+
+              const trimmedLine = line.trim();
+              if (trimmedLine) {
+                if (captureNextLineForPackage && !packageName) {
+                  packageName = trimmedLine;
+                  captureNextLineForPackage = false;
+                }
+                if (captureNextLineForCategory && !originalCategory) {
+                  originalCategory = trimmedLine;
+                  captureNextLineForCategory = false;
+                }
+              }
+            }
+            
+            if (!packageName) {
+              core.setFailed('Could not extract NPM Package Name from issue body.');
+              return;
+            }
+            if (!originalCategory) {
+              core.setFailed('Could not extract Category from issue body.');
+              return;
+            }
+
+            core.setOutput('packageName', packageName);
+            core.setOutput('originalCategory', originalCategory);
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          
+      - name: Construct JSON Payload and Send POST Request
         run: |
-          set -e # Exit immediately if a command exits with a non-zero status.
+          PACKAGE_NAME="${{ steps.extract_issue_data.outputs.packageName }}"
+          RATING="${{ steps.parse_command.outputs.rating }}"
+          VERIFIED="${{ steps.parse_command.outputs.verified }}"
+          OVERRIDDEN_CATEGORY="${{ steps.parse_command.outputs.overridden_category }}"
+          ORIGINAL_CATEGORY="${{ steps.extract_issue_data.outputs.originalCategory }}"
+          
+          # 根据需求，如果命令中提供了 category，则覆盖 Issue 中的 category；否则使用 Issue 中的 category
+          FINAL_CATEGORY="${OVERRIDDEN_CATEGORY:-$ORIGINAL_CATEGORY}"
 
-          ISSUE_NUMBER=${{ github.event.issue.number }}
-          COMMENT_BODY="${{ github.event.comment.body }}"
+          # 构建 JSON payload
+          # 使用 jq 工具构建 JSON，它可以安全地处理字符串和类型
+          JSON_PAYLOAD=$(jq -n \
+            --arg pkg "$PACKAGE_NAME" \
+            --argjson rt "$RATING" \
+            --argjson vf "$VERIFIED" \
+            --arg cat "$FINAL_CATEGORY" \
+            --arg apikey "${{ secrets.KOISHI_PLUGIN_ADD_API_KEY }}" \
+            '{
+              "packageName": $pkg,
+              "rating": $rt,
+              "verified": $vf,
+              "apiKey": $apikey,
+              "category": $cat
+            }')
 
-          echo "Fetching issue body for issue #$ISSUE_NUMBER..."
-          ISSUE_BODY_JSON=$(gh issue view "$ISSUE_NUMBER" --json body)
-          ISSUE_BODY=$(echo "$ISSUE_BODY_JSON" | jq -r .body)
+          echo "Attempting to POST to API:"
+          echo "$JSON_PAYLOAD"
 
-          echo "Issue Body (first 300 chars): $(echo "$ISSUE_BODY" | head -c 300)..."
-          echo "Comment Body: $COMMENT_BODY"
-
-          # --- Function to extract value after a header, skipping blank lines ---
-          # $1: Full issue body
-          # $2: Header text (e.g., "### NPM Package Name")
-          extract_value_after_header() {
-            local body="$1"
-            local header_pattern="^${2}$" # Match the exact header line
-            # sed: Find header, then print first non-blank line after it
-            # n: read next line
-            # :loop; /^\s*$/{n; b loop}: if line is blank, read next and loop
-            # p: print non-blank line
-            # q: quit
-            echo "$body" | sed -n -e "/${header_pattern}/{n; :loop; /^\s*$/{n; b loop}; p; q}" | xargs
-          }
-
-          # --- Extract packageName from issue body ---
-          PACKAGE_NAME_RAW=$(extract_value_after_header "$ISSUE_BODY" "### NPM Package Name")
-          echo "Raw Package Name from Issue: '$PACKAGE_NAME_RAW'"
-
-          if [[ -z "$PACKAGE_NAME_RAW" || "$PACKAGE_NAME_RAW" == "NPM Package Name" ]]; then # Second check less likely with sed
-            ERROR_MESSAGE="❌ Error: Could not extract \`packageName\` from the issue body.
-            The bot expected to find a header '### NPM Package Name' followed by the package name in the issue's Markdown.
-            Please ensure the issue was created using the correct template and the 'NPM Package Name' field was filled.
-            Raw value extracted: '$PACKAGE_NAME_RAW'"
-            echo "::error::$ERROR_MESSAGE"
-            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
-            exit 1
-          fi
-
-          # --- Validate packageName format ---
-          if ! [[ "$PACKAGE_NAME_RAW" =~ ^@([a-zA-Z0-9_.-]+)\/koishi-plugin-([a-zA-Z0-9_.-]+)$ || \
-                  "$PACKAGE_NAME_RAW" =~ ^koishi-plugin-([a-zA-Z0-9_.-]+)$ || \
-                  "$PACKAGE_NAME_RAW" =~ ^@koishijs\/plugin-([a-zA-Z0-9_.-]+)$ ]]; then
-            ERROR_MESSAGE="❌ Error: Invalid \`packageName\` format: \`$PACKAGE_NAME_RAW\`.
-            Allowed formats are \`@scope/koishi-plugin-*\`, \`koishi-plugin-*\`, or \`@koishijs/plugin-*\`."
-            echo "::error::$ERROR_MESSAGE"
-            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
-            exit 1
-          fi
-          PACKAGE_NAME="$PACKAGE_NAME_RAW"
-          echo "Validated Package Name: $PACKAGE_NAME"
-
-          # --- Extract initial category from issue body ---
-          INITIAL_CATEGORY_RAW=$(extract_value_after_header "$ISSUE_BODY" "### Category")
-          echo "Raw Initial Category from Issue: '$INITIAL_CATEGORY_RAW'"
-
-          if [[ -z "$INITIAL_CATEGORY_RAW" || "$INITIAL_CATEGORY_RAW" == "Category" ]]; then # Second check less likely
-             echo "::warning::Could not reliably extract initial category from issue. Will rely on command argument if provided."
-             INITIAL_CATEGORY_RAW=""
-          fi
-          echo "Initial Category (after cleanup): '$INITIAL_CATEGORY_RAW'"
-
-          # --- Parse command arguments ---
-          VERIFIED_ARG=$(echo "$COMMENT_BODY" | grep -oP 'verified:\s*\K(true|false)')
-          RATING_ARG=$(echo "$COMMENT_BODY" | grep -oP 'rating:\s*\K([0-9]+(\.[0-9]+)?)')
-          CATEGORY_ARG_FROM_CMD=$(echo "$COMMENT_BODY" | grep -oP 'category:\s*\K([^ ]+)')
-
-          if [[ -z "$VERIFIED_ARG" || -z "$RATING_ARG" ]]; then
-            ERROR_MESSAGE="❌ Error: Command is missing \`verified\` or \`rating\`.
-            Usage: \`/approve-plugin verified:[true|false] rating:[0.0-5.0] [category:new-category]\`"
-            echo "::error::$ERROR_MESSAGE"
-            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
-            exit 1
-          fi
-
-          FINAL_CATEGORY="$CATEGORY_ARG_FROM_CMD"
-          if [[ -z "$FINAL_CATEGORY" ]]; then
-            FINAL_CATEGORY="$INITIAL_CATEGORY_RAW"
-          fi
-
-          if [[ -z "$FINAL_CATEGORY" ]]; then
-            ERROR_MESSAGE="❌ Error: \`category\` was not provided in the approval command and could not be reliably extracted from the original issue submission."
-            echo "::error::$ERROR_MESSAGE"
-            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
-            exit 1
-          fi
-
-          echo "Using Package Name: $PACKAGE_NAME"
-          echo "Using Verified: $VERIFIED_ARG"
-          echo "Using Rating: $RATING_ARG"
-          echo "Using Category: $FINAL_CATEGORY"
-
-          if [[ -z "$PLUGIN_API_KEY" ]]; then
-            ERROR_MESSAGE="❌ Error: PLUGIN_API_KEY is not configured in the workflow secrets."
-            echo "::error::$ERROR_MESSAGE"
-            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
-            exit 1
-          fi
-
-          JSON_PAYLOAD=$(cat <<EOF
-          {
-            "packageName": "$PACKAGE_NAME",
-            "rating": $RATING_ARG,
-            "verified": $VERIFIED_ARG,
-            "apiKey": "$PLUGIN_API_KEY",
-            "category": "$FINAL_CATEGORY"
-          }
-          EOF
-          )
-
-          echo "Payload: $JSON_PAYLOAD"
-
-          HTTP_RESPONSE_WITH_CODE=$(curl -s -w "\\n%{http_code}" -X POST "$API_ENDPOINT" \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD")
-
-          HTTP_STATUS=$(echo "$HTTP_RESPONSE_WITH_CODE" | tail -n1)
-          HTTP_BODY=$(echo "$HTTP_RESPONSE_WITH_CODE" | sed '$d')
-
-          echo "API Response Status: $HTTP_STATUS"
-          echo "API Response Body (first 200 chars): $(echo "$HTTP_BODY" | head -c 200)..."
-
-          if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then
-            SUCCESS_MESSAGE="✅ Plugin \`$PACKAGE_NAME\` submitted successfully to the registry with rating \`$RATING_ARG\`, verified status \`$VERIFIED_ARG\`, and category \`$FINAL_CATEGORY\`."
-            echo "$SUCCESS_MESSAGE"
-            gh issue comment "$ISSUE_NUMBER" --body "$SUCCESS_MESSAGE"
-            gh issue close "$ISSUE_NUMBER" --reason "completed"
-          else
-            SANITIZED_API_BODY=$(echo "$HTTP_BODY" | tr -d '`' | head -c 500)
-            if [[ ${#HTTP_BODY} -gt 500 ]]; then SANITIZED_API_BODY="$SANITIZED_API_BODY..."; fi
-
-            ERROR_MESSAGE="❌ Error submitting plugin \`$PACKAGE_NAME\` to the registry.
-            API responded with status: \`$HTTP_STATUS\`
-            API Response Body:
-            \`\`\`
-            $SANITIZED_API_BODY
-            \`\`\`"
-            echo "::error::Error submitting plugin. Status: $HTTP_STATUS. Body: $HTTP_BODY"
-            gh issue comment "$ISSUE_NUMBER" --body "$ERROR_MESSAGE"
-            exit 1
-          fi
+          curl -X POST \
+               -H "Content-Type: application/json" \
+               -d "$JSON_PAYLOAD" \
+               http://exp.kp.itzdrli.cc/api/add-plugin
+        # Note: If curl returns a non-zero exit code (e.g., HTTP 4xx/5xx status),
+        # this step will fail, and the workflow will stop.
